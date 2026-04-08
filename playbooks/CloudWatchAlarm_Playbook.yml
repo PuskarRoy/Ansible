@@ -9,9 +9,13 @@
   vars_files:
     - instances_details.yml
 
+  vars_prompt:
+    - name: sns_topic_arn
+      prompt: "Enter SNS Topic ARN"
+      private: false
+
   vars:
     cpu_thresholds: [85, 95]
-
     memory_thresholds: [85, 95]
 
     disk_display_thresholds: [85, 95]
@@ -21,9 +25,31 @@
 
     disk_letter: "C:"
 
-    sns_actions: ["{{ sns_topic_arn }}"]
-
   tasks:
+
+    ####################################################################
+    # Get Region from IMDSv2
+    ####################################################################
+    - name: Get AWS region from instance metadata
+      ansible.builtin.shell: |
+        TOKEN=$(curl -s -X PUT "http://169.254.169.254/latest/api/token" \
+          -H "X-aws-ec2-metadata-token-ttl-seconds: 21600")
+
+        curl -s -H "X-aws-ec2-metadata-token: $TOKEN" \
+          http://169.254.169.254/latest/dynamic/instance-identity/document \
+          | grep region | awk -F\" '{print $4}'
+      register: region_output
+      changed_when: false
+      args:
+        executable: /bin/bash
+
+    - name: Set region variable
+      ansible.builtin.set_fact:
+        region: "{{ region_output.stdout }}"
+
+    - name: Debug region (optional)
+      ansible.builtin.debug:
+        msg: "Using region: {{ region }}"
 
     ####################################################################
     # Validation
@@ -52,7 +78,6 @@
               } ]
           }}
       loop: "{{ instances | product(cpu_thresholds) | list }}"
-      no_log: true
       changed_when: false
 
     - name: Create CPU alarms
@@ -69,7 +94,8 @@
         evaluation_periods: 1
         dimensions:
           InstanceId: "{{ alarm.instance }}"
-        alarm_actions: "{{ sns_actions }}"
+        alarm_actions:
+          - "{{ sns_topic_arn }}"
         unit: Percent
       loop: "{{ cpu_alarms }}"
       loop_control:
@@ -78,7 +104,7 @@
     ####################################################################
     # Status checks
     ####################################################################
-    - name: Create StatusCheckFailed_Instance alarms
+    - name: StatusCheckFailed_Instance
       amazon.aws.cloudwatch_metric_alarm:
         state: present
         region: "{{ region }}"
@@ -98,7 +124,7 @@
         unit: Count
       loop: "{{ instances }}"
 
-    - name: Create StatusCheckFailed_System alarms
+    - name: StatusCheckFailed_System
       amazon.aws.cloudwatch_metric_alarm:
         state: present
         region: "{{ region }}"
@@ -118,7 +144,7 @@
         unit: Count
       loop: "{{ instances }}"
 
-    - name: Create StatusCheckFailed_AttachedEBS alarms
+    - name: StatusCheckFailed_AttachedEBS
       amazon.aws.cloudwatch_metric_alarm:
         state: present
         region: "{{ region }}"
@@ -132,7 +158,8 @@
         evaluation_periods: 1
         dimensions:
           InstanceId: "{{ item.instance }}"
-        alarm_actions: "{{ sns_actions }}"
+        alarm_actions:
+          - "{{ sns_topic_arn }}"
         unit: Count
       loop: "{{ instances }}"
 
@@ -153,16 +180,9 @@
               } ]
           }}
       loop: "{{ instances | product(memory_thresholds) | list }}"
-      no_log: true
       changed_when: false
 
     - name: Create Memory alarms
-      vars:
-        final_dims:
-          InstanceId: "{{ alarm.instance }}"
-          ImageId: "{{ alarm.imageid }}"
-          InstanceType: "{{ alarm.instance_type }}"
-          objectname: "Memory"
       amazon.aws.cloudwatch_metric_alarm:
         state: present
         region: "{{ region }}"
@@ -174,8 +194,13 @@
         threshold: "{{ alarm.threshold }}"
         period: 300
         evaluation_periods: 1
-        dimensions: "{{ final_dims }}"
-        alarm_actions: "{{ sns_actions }}"
+        dimensions:
+          InstanceId: "{{ alarm.instance }}"
+          ImageId: "{{ alarm.imageid }}"
+          InstanceType: "{{ alarm.instance_type }}"
+          objectname: "Memory"
+        alarm_actions:
+          - "{{ sns_topic_arn }}"
       loop: "{{ mem_alarms }}"
       loop_control:
         loop_var: alarm
@@ -198,17 +223,9 @@
               } ]
           }}
       loop: "{{ instances | product(disk_display_thresholds) | list }}"
-      no_log: true
       changed_when: false
 
     - name: Create Disk alarms
-      vars:
-        final_dims:
-          InstanceId: "{{ alarm.instance }}"
-          ImageId: "{{ alarm.imageid }}"
-          InstanceType: "{{ alarm.instance_type }}"
-          objectname: "LogicalDisk"
-          instance: "{{ disk_letter }}"
       amazon.aws.cloudwatch_metric_alarm:
         state: present
         region: "{{ region }}"
@@ -220,8 +237,14 @@
         threshold: "{{ alarm.free_threshold }}"
         period: 300
         evaluation_periods: 1
-        dimensions: "{{ final_dims }}"
-        alarm_actions: "{{ sns_actions }}"
+        dimensions:
+          InstanceId: "{{ alarm.instance }}"
+          ImageId: "{{ alarm.imageid }}"
+          InstanceType: "{{ alarm.instance_type }}"
+          objectname: "LogicalDisk"
+          instance: "{{ disk_letter }}"
+        alarm_actions:
+          - "{{ sns_topic_arn }}"
       loop: "{{ disk_alarms }}"
       loop_control:
         loop_var: alarm
