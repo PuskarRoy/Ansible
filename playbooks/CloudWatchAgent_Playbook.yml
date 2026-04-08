@@ -1,199 +1,197 @@
-- name: Update and upgrade packages on all Linux servers
+---
+- name: Run PowerShell script to Install Cloud_Watch_Agent
   hosts: all
-  become: true
-  gather_facts: true
+  gather_facts: false
 
   tasks:
-    - name: Update and upgrade on Ubuntu/Debian
-      ansible.builtin.apt:
-        update_cache: yes
-      when: ansible_facts['os_family'] == "Debian"
+    - name: Download CloudWatch Agent MSI
+      ansible.windows.win_get_url:
+        url: https://amazoncloudwatch-agent.s3.amazonaws.com/windows/amd64/latest/amazon-cloudwatch-agent.msi
+        dest: C:\Users\Administrator\Downloads\amazon-cloudwatch-agent.msi
+    
+    - name: Download AWS CLI MSI
+      ansible.windows.win_get_url:
+        url: https://awscli.amazonaws.com/AWSCLIV2.msi
+        dest: C:\Users\Administrator\Downloads\aws_cli.msi
 
-    - name: Install wget and unzip on Ubuntu/Debian
-      ansible.builtin.apt:
-        name:
-          - wget
-          - unzip
-        state: present
-      when: ansible_facts['os_family'] == "Debian"
 
-    - name: Update and upgrade on Amazon Linux or RedHat family
-      ansible.builtin.yum:
-        name: "*"
-        state: latest
-      when: ansible_facts['os_family'] in ["RedHat", "Amazon"]
+    - name: Run the PowerShell script for CloudWatchAgent and Aws CLi
+      ansible.windows.win_shell: |
+        Start-Process `
+          -FilePath "msiexec.exe" `
+          -ArgumentList '/i "C:\Users\Administrator\Downloads\amazon-cloudwatch-agent.msi" /qn /norestart' `
+          -Wait
 
-    - name: Install wget and unzip on Amazon Linux or RedHat family
-      ansible.builtin.yum:
-        name:
-          - wget
-          - unzip
-        state: present
-      when: ansible_facts['os_family'] in ["RedHat", "Amazon"]
+        Start-Process `
+          -FilePath "msiexec.exe" `
+          -ArgumentList '/i "C:\Users\Administrator\Downloads\aws_cli.msi" /qn /norestart' `
+          -Wait
 
-    - name: Install AWS CLI
-      ansible.builtin.shell: |
-        curl "https://awscli.amazonaws.com/awscli-exe-linux-x86_64.zip" -o "awscliv2.zip"
-        unzip -o awscliv2.zip
-        ./aws/install
-        rm -rf awscliv2.zip aws
-      args:
-        executable: /bin/bash
 
-    - name: Install and configure CloudWatch Agent
-      ansible.builtin.shell: |
-        TEMP_DIR="/tmp/cloudwatch-agent-temp"
-        CONFIG_FILE="/opt/aws/amazon-cloudwatch-agent/bin/config.json"
-
-        mkdir -p "$TEMP_DIR"
-
-        wget -O "$TEMP_DIR/AmazonCloudWatchAgent.zip" https://s3.amazonaws.com/amazoncloudwatch-agent/linux/amd64/latest/AmazonCloudWatchAgent.zip
-
-        unzip -q "$TEMP_DIR/AmazonCloudWatchAgent.zip" -d "$TEMP_DIR"
-
-        cd "$TEMP_DIR"
-        sudo ./install.sh
-        cd - >/dev/null || exit 1
-
-        mkdir -p "$(dirname "$CONFIG_FILE")"
-
-        cat > "$CONFIG_FILE" <<'EOT'
+        $config = @'
         {
-            "agent": {
-                "metrics_collection_interval": 60,
-                "run_as_user": "cwagent"
+          "metrics": {
+            "append_dimensions": {
+              "AutoScalingGroupName": "${aws:AutoScalingGroupName}",
+              "ImageId": "${aws:ImageId}",
+              "InstanceId": "${aws:InstanceId}",
+              "InstanceType": "${aws:InstanceType}"
             },
-            "metrics": {
-                "append_dimensions": {
-                    "AutoScalingGroupName": "${aws:AutoScalingGroupName}",
-                    "ImageId": "${aws:ImageId}",
-                    "InstanceId": "${aws:InstanceId}"
-                },
-                "metrics_collected": {
-                    "disk": {
-                        "measurement": [
-                            "used_percent"
-                        ],
-                        "metrics_collection_interval": 60,
-                        "resources": [
-                            "/"
-                        ]
-                    },
-                    "mem": {
-                        "measurement": [
-                            "mem_used_percent"
-                        ],
-                        "metrics_collection_interval": 60
-                    }
-                }
+            "metrics_collected": {
+              "LogicalDisk": {
+                "measurement": [
+                  "% Free Space"
+                ],
+                "metrics_collection_interval": 60,
+                "resources": [
+                  "C:"
+                ]
+              },
+              "Memory": {
+                "measurement": [
+                  "% Committed Bytes In Use"
+                ],
+                "metrics_collection_interval": 60
+              }
             }
+          }
         }
-        EOT
-
-        sudo /opt/aws/amazon-cloudwatch-agent/bin/amazon-cloudwatch-agent-ctl \
-          -a fetch-config -m ec2 -c "file:$CONFIG_FILE" -s
-
-        service amazon-cloudwatch-agent start
-
-        rm -rf "$TEMP_DIR"
-      args:
-        executable: /bin/bash
+        '@
 
 
+        Set-Content "C:\Program Files\Amazon\AmazonCloudWatchAgent\config.json" $config
 
-    - name: Run a script to gather instance details
+        & "C:\Program Files\Amazon\AmazonCloudWatchAgent\amazon-cloudwatch-agent-ctl.ps1" -a fetch-config -m ec2 -s -c file:"C:\Program Files\Amazon\AmazonCloudWatchAgent\config.json"
+
+    - name: Run the Powershell script for Generating instance details
+      ansible.windows.win_shell: |
+        # Fail immediately on any error
+        $ErrorActionPreference = "Stop"
+
+        # -------- IMDSv2 Token --------
+        $token = Invoke-RestMethod -Method PUT `
+          -Uri "http://169.254.169.254/latest/api/token" `
+          -Headers @{ "X-aws-ec2-metadata-token-ttl-seconds" = "21600" }
+
+        $headers = @{ "X-aws-ec2-metadata-token" = $token }
+
+        # -------- Metadata --------
+        $INSTANCE_ID = Invoke-RestMethod `
+          -Uri "http://169.254.169.254/latest/meta-data/instance-id" `
+          -Headers $headers
+
+        $IMAGE_ID = Invoke-RestMethod `
+          -Uri "http://169.254.169.254/latest/meta-data/ami-id" `
+          -Headers $headers
+
+        $INSTANCE_TYPE = Invoke-RestMethod `
+          -Uri "http://169.254.169.254/latest/meta-data/instance-type" `
+          -Headers $headers
+
+        # -------- Region (important for AWS CLI) --------
+        $REGION = Invoke-RestMethod `
+          -Uri "http://169.254.169.254/latest/meta-data/placement/region" `
+          -Headers $headers
+
+        $AWS = "C:\Program Files\Amazon\AWSCLIV2\aws.exe"
+
+        # Optional safety check
+        if (!(Test-Path $AWS)) {
+            throw "AWS CLI not found at $AWS"
+        }
+
+        # -------- Get Instance Name --------
+        $INSTANCE_NAME = & $AWS ec2 describe-tags `
+          --region $REGION `
+          --filters "Name=resource-id,Values=$INSTANCE_ID" "Name=key,Values=Name" `
+          --query "Tags[0].Value" `
+          --output text
+
+        # -------- Output file --------
+        $FilePath = "C:\Users\Administrator\Downloads\data_$INSTANCE_ID.txt"
+
+        # -------- File content --------
+        $Content = @"
+        name: $INSTANCE_NAME
+        instance_id: $INSTANCE_ID
+        imageid: $IMAGE_ID
+        instance-type: $INSTANCE_TYPE
+        "@
+
+        # -------- Write UTF-8 WITHOUT BOM --------
+        [System.IO.File]::WriteAllText(
+            $FilePath,
+            $Content,
+            (New-Object System.Text.UTF8Encoding($false))
+        )
+
+        Write-Output "Metadata file created: $FilePath" 
+
+    - name: Collect instance data files and clean up remote
+      block:
+        - ansible.builtin.file:
+            path: ./instance_data
+            state: directory
+            mode: '0755'
+          delegate_to: localhost
+          run_once: true
+    
+        - ansible.windows.win_find:
+            paths: 'C:/Users/Administrator/Downloads'
+            patterns: 
+              - 'data_*.txt'
+          register: data_files
+
+        - ansible.builtin.fetch:
+            src: "{{ item.path }}"
+            dest: ./instance_data/
+            flat: yes
+          loop: "{{ data_files.files }}"
+          when: data_files.matched > 0
+
+        - ansible.windows.win_file:
+            path: "{{ item.path }}"
+            state: absent
+          loop: "{{ data_files.files }}"
+          when: data_files.matched > 0
+
+    - name: Clean-Up from local server
       ansible.builtin.shell: |
-        TOKEN=$(curl -s -X PUT "http://169.254.169.254/latest/api/token" \
-          -H "X-aws-ec2-metadata-token-ttl-seconds: 21600")
-
-        INSTANCE_ID=$(curl -s -H "X-aws-ec2-metadata-token: $TOKEN" \
-          http://169.254.169.254/latest/meta-data/instance-id)
-
-        ROOT_DEVICE=$(lsblk -fro NAME,FSTYPE,MOUNTPOINT | grep " /$" | awk '{print $1}')
-
-        IMAGE_ID=$(/usr/local/bin/aws ec2 describe-instances --instance-ids "$INSTANCE_ID" \
-          --query 'Reservations[].Instances[].ImageId' --output text)
-
-        FSTYPE=$(lsblk -fro NAME,FSTYPE,MOUNTPOINT | grep " /$" | awk '{print $2}')
-
-        INSTANCE_NAME=$(/usr/local/bin/aws ec2 describe-instances --instance-ids "$INSTANCE_ID" \
-          --query "Reservations[].Instances[].Tags[?Key=='Name'].Value | [0]" \
-          --output text)
-
-        OUTPUT_FILE="$HOME/data_${INSTANCE_ID}.txt"
-
-        {
-        echo "name: $INSTANCE_NAME"
-        echo "instance: $INSTANCE_ID"
-        echo "device: $ROOT_DEVICE"
-        echo "fstype: $FSTYPE"
-        echo "imageid: $IMAGE_ID"
-        } > "$OUTPUT_FILE"
-      args:
-        executable: /bin/bash
-
-    - name: Find data file using regex
-      ansible.builtin.find:
-        paths: "{{ ansible_user_dir }}"
-        patterns: '^data_.*\.txt$'
-        use_regex: yes
-        file_type: file
-      register: found_files
-
-    - name: Create local folder
-      delegate_to: localhost
-      run_once: true
-      become: false
-      ansible.builtin.file:
-        path: "./instance_data"
-        state: directory
-
-    - name: Fetch files
-      ansible.builtin.fetch:
-        src: "{{ item.path }}"
-        dest: "./instance_data/"
-        flat: yes
-      loop: "{{ found_files.files }}"
-      when: found_files.matched | default(0) > 0
-
-    - name: Delete files from remote
-      ansible.builtin.shell: rm -f data_*
-      args:
-        chdir: "{{ ansible_user_dir }}"
-      when: found_files.matched | default(0) > 0
-
-    - name: Aggregate instance data
-      ansible.builtin.shell: |
-        OUTPUT="instances_details.yml"
-
-        echo "instances:" > "$OUTPUT"
-
         cd ./instance_data || exit 1
+
+        OUTPUT="../instances_details.yml"
+
+        # Start fresh YAML
+        echo "instances:" > "$OUTPUT"
 
         for f in data_*; do
             [ -f "$f" ] || continue
 
-            NAME=$(grep '^name:' "$f" | cut -d':' -f2- | xargs)
-            INSTANCE=$(grep '^instance:' "$f" | cut -d':' -f2- | xargs)
-            DEVICE=$(grep '^device:' "$f" | cut -d':' -f2- | xargs)
-            FSTYPE=$(grep '^fstype:' "$f" | cut -d':' -f2- | xargs)
-            IMAGEID=$(grep '^imageid:' "$f" | cut -d':' -f2- | xargs)
+            NAME=$(grep '^name:' "$f" | cut -d':' -f2- | xargs || true)
+            INSTANCE_ID=$(grep '^instance_id:' "$f" | cut -d':' -f2- | xargs || true)
+            IMAGEID=$(grep '^imageid:' "$f" | cut -d':' -f2- | xargs || true)
+            INSTANCE_TYPE=$(grep '^instance-type:' "$f" | cut -d':' -f2- | xargs || true)
 
-            echo "  - name: $NAME" >> ../$OUTPUT
-            echo "    instance: $INSTANCE" >> ../$OUTPUT
-            echo "    device: $DEVICE" >> ../$OUTPUT
-            echo "    fstype: $FSTYPE" >> ../$OUTPUT
-            echo "    imageid: $IMAGEID" >> ../$OUTPUT
-            echo "" >> ../$OUTPUT
+            # Skip if critical data missing
+            if [[ -z "$INSTANCE_ID" ]]; then
+                echo "Skipping file $f (missing instance_id)"
+                continue
+            fi
+
+            # Write YAML safely (quoted to avoid YAML parsing issues)
+            cat <<EOF >> "$OUTPUT"
+          - name: "${NAME}"
+            instance: "${INSTANCE_ID}"
+            imageid: "${IMAGEID}"
+            instance_type: "${INSTANCE_TYPE}"
+
+        EOF
+
         done
-      args:
-        executable: /bin/bash
-      delegate_to: localhost
-      run_once: true
 
-    - name: Cleanup local temp folder
-      ansible.builtin.file:
-        path: "./instance_data"
-        state: absent
+        cd ..
+        rm -rf ./instance_data
+
+        echo "YAML file created at: $OUTPUT"
       delegate_to: localhost
-      run_once: true
+      run_once: true   
