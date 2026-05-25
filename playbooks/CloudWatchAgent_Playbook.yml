@@ -65,9 +65,8 @@
             },
             "metrics": {
                 "append_dimensions": {
-                    "AutoScalingGroupName": "${aws:AutoScalingGroupName}",
-                    "ImageId": "${aws:ImageId}",
-                    "InstanceId": "${aws:InstanceId}"
+                    "AutoScalingGroupName": "\${aws:AutoScalingGroupName}",
+                    "InstanceId": "\${aws:InstanceId}"
                 },
                 "metrics_collected": {
                     "disk": {
