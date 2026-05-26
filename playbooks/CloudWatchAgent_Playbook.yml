@@ -1,59 +1,83 @@
-- name: Update and upgrade packages on all Linux servers
+---
+- name: Configure Linux Servers
   hosts: all
   become: true
   gather_facts: true
 
   tasks:
-    - name: Update and upgrade on Ubuntu/Debian
+
+    #################################################################
+    # Update Packages
+    #################################################################
+
+    - name: Update apt cache on Debian/Ubuntu
       ansible.builtin.apt:
         update_cache: yes
       when: ansible_facts['os_family'] == "Debian"
 
-    - name: Install wget and unzip on Ubuntu/Debian
+    - name: Install required packages on Debian/Ubuntu
       ansible.builtin.apt:
         name:
           - wget
           - unzip
+          - curl
         state: present
       when: ansible_facts['os_family'] == "Debian"
 
-    - name: Update and upgrade on Amazon Linux or RedHat family
-      ansible.builtin.yum:
-        name: "*"
-        state: latest
-      when: ansible_facts['os_family'] in ["RedHat", "Amazon"]
-
-    - name: Install wget and unzip on Amazon Linux or RedHat family
+    - name: Install required packages on RedHat/Amazon Linux
       ansible.builtin.yum:
         name:
           - wget
           - unzip
+          - curl
         state: present
-      when: ansible_facts['os_family'] in ["RedHat", "Amazon"]
+      when: ansible_facts['os_family'] == "RedHat"
 
-    - name: Install AWS CLI
+    #################################################################
+    # Install AWS CLI
+    #################################################################
+
+    - name: Install AWS CLI v2
       ansible.builtin.shell: |
-        curl "https://awscli.amazonaws.com/awscli-exe-linux-x86_64.zip" -o "awscliv2.zip"
-        unzip -o awscliv2.zip
-        ./aws/install
-        rm -rf awscliv2.zip aws
+        set -e
+
+        cd /tmp
+
+        rm -rf aws awscliv2.zip
+
+        curl -s "https://awscli.amazonaws.com/awscli-exe-linux-x86_64.zip" -o "awscliv2.zip"
+
+        unzip -oq awscliv2.zip
+
+        ./aws/install --update
+
+        rm -rf aws awscliv2.zip
       args:
         executable: /bin/bash
 
-    - name: Install and configure CloudWatch Agent
+    #################################################################
+    # Install CloudWatch Agent
+    #################################################################
+
+    - name: Install and Configure CloudWatch Agent
       ansible.builtin.shell: |
+        set -e
+
         TEMP_DIR="/tmp/cloudwatch-agent-temp"
         CONFIG_FILE="/opt/aws/amazon-cloudwatch-agent/bin/config.json"
 
+        rm -rf "$TEMP_DIR"
+
         mkdir -p "$TEMP_DIR"
 
-        wget -O "$TEMP_DIR/AmazonCloudWatchAgent.zip" https://s3.amazonaws.com/amazoncloudwatch-agent/linux/amd64/latest/AmazonCloudWatchAgent.zip
-
-        unzip -q "$TEMP_DIR/AmazonCloudWatchAgent.zip" -d "$TEMP_DIR"
-
         cd "$TEMP_DIR"
-        sudo ./install.sh
-        cd - >/dev/null || exit 1
+
+        wget -q -O AmazonCloudWatchAgent.zip \
+        https://s3.amazonaws.com/amazoncloudwatch-agent/linux/amd64/latest/AmazonCloudWatchAgent.zip
+
+        unzip -oq AmazonCloudWatchAgent.zip
+
+        ./install.sh
 
         mkdir -p "$(dirname "$CONFIG_FILE")"
 
@@ -65,9 +89,9 @@
             },
             "metrics": {
                 "append_dimensions": {
-                    "AutoScalingGroupName": "\${aws:AutoScalingGroupName}",
-                    "ImageId": "\${aws:ImageId}",
-                    "InstanceId": "\${aws:InstanceId}"
+                    "AutoScalingGroupName": "${aws:AutoScalingGroupName}",
+                    "ImageId": "${aws:ImageId}",
+                    "InstanceId": "${aws:InstanceId}"
                 },
                 "metrics_collected": {
                     "disk": {
@@ -90,50 +114,80 @@
         }
         EOT
 
-        sudo /opt/aws/amazon-cloudwatch-agent/bin/amazon-cloudwatch-agent-ctl \
-          -a fetch-config -m ec2 -c "file:$CONFIG_FILE" -s
+        /opt/aws/amazon-cloudwatch-agent/bin/amazon-cloudwatch-agent-ctl \
+          -a fetch-config \
+          -m ec2 \
+          -c file:$CONFIG_FILE \
+          -s
 
         systemctl enable amazon-cloudwatch-agent
+
         systemctl restart amazon-cloudwatch-agent
 
         rm -rf "$TEMP_DIR"
       args:
         executable: /bin/bash
 
+    #################################################################
+    # Verify CloudWatch Agent
+    #################################################################
 
-
-    - name: Run a script to gather instance details
+    - name: Check CloudWatch Agent status
       ansible.builtin.shell: |
+        systemctl status amazon-cloudwatch-agent --no-pager
+      register: cw_status
+      ignore_errors: true
+
+    - name: Show CloudWatch Agent status
+      ansible.builtin.debug:
+        var: cw_status.stdout_lines
+
+    #################################################################
+    # Gather EC2 Instance Details
+    #################################################################
+
+    - name: Gather instance details
+      ansible.builtin.shell: |
+        set -e
+
         TOKEN=$(curl -s -X PUT "http://169.254.169.254/latest/api/token" \
           -H "X-aws-ec2-metadata-token-ttl-seconds: 21600")
 
-        INSTANCE_ID=$(curl -s -H "X-aws-ec2-metadata-token: $TOKEN" \
+        INSTANCE_ID=$(curl -s \
+          -H "X-aws-ec2-metadata-token: $TOKEN" \
           http://169.254.169.254/latest/meta-data/instance-id)
 
         ROOT_DEVICE=$(lsblk -fro NAME,FSTYPE,MOUNTPOINT | grep " /$" | awk '{print $1}')
 
-        IMAGE_ID=$(/usr/local/bin/aws ec2 describe-instances --instance-ids "$INSTANCE_ID" \
-          --query 'Reservations[].Instances[].ImageId' --output text)
-
         FSTYPE=$(lsblk -fro NAME,FSTYPE,MOUNTPOINT | grep " /$" | awk '{print $2}')
 
-        INSTANCE_NAME=$(/usr/local/bin/aws ec2 describe-instances --instance-ids "$INSTANCE_ID" \
+        IMAGE_ID=$(aws ec2 describe-instances \
+          --instance-ids "$INSTANCE_ID" \
+          --query 'Reservations[].Instances[].ImageId' \
+          --output text)
+
+        INSTANCE_NAME=$(aws ec2 describe-instances \
+          --instance-ids "$INSTANCE_ID" \
           --query "Reservations[].Instances[].Tags[?Key=='Name'].Value | [0]" \
           --output text)
 
         OUTPUT_FILE="$HOME/data_${INSTANCE_ID}.txt"
 
         {
-        echo "name: $INSTANCE_NAME"
-        echo "instance: $INSTANCE_ID"
-        echo "device: $ROOT_DEVICE"
-        echo "fstype: $FSTYPE"
-        echo "imageid: $IMAGE_ID"
+          echo "name: $INSTANCE_NAME"
+          echo "instance: $INSTANCE_ID"
+          echo "device: $ROOT_DEVICE"
+          echo "fstype: $FSTYPE"
+          echo "imageid: $IMAGE_ID"
         } > "$OUTPUT_FILE"
       args:
         executable: /bin/bash
 
-    - name: Find data file using regex
+    #################################################################
+    # Find Generated Files
+    #################################################################
+
+    - name: Find instance data files
       ansible.builtin.find:
         paths: "{{ ansible_user_dir }}"
         patterns: '^data_.*\.txt$'
@@ -141,7 +195,11 @@
         file_type: file
       register: found_files
 
-    - name: Create local folder
+    #################################################################
+    # Create Local Folder
+    #################################################################
+
+    - name: Create local temp folder
       delegate_to: localhost
       run_once: true
       become: false
@@ -149,7 +207,11 @@
         path: "./instance_data"
         state: directory
 
-    - name: Fetch files
+    #################################################################
+    # Fetch Files
+    #################################################################
+
+    - name: Fetch instance data files
       ansible.builtin.fetch:
         src: "{{ item.path }}"
         dest: "./instance_data/"
@@ -157,44 +219,61 @@
       loop: "{{ found_files.files }}"
       when: found_files.matched | default(0) > 0
 
-    - name: Delete files from remote
-      ansible.builtin.shell: rm -f data_*
-      args:
-        chdir: "{{ ansible_user_dir }}"
+    #################################################################
+    # Delete Remote Files
+    #################################################################
+
+    - name: Delete remote temp files
+      ansible.builtin.file:
+        path: "{{ item.path }}"
+        state: absent
+      loop: "{{ found_files.files }}"
       when: found_files.matched | default(0) > 0
 
-    - name: Aggregate instance data
+    #################################################################
+    # Aggregate Data
+    #################################################################
+
+    - name: Aggregate instance details
+      delegate_to: localhost
+      run_once: true
       ansible.builtin.shell: |
+        set -e
+
         OUTPUT="instances_details.yml"
 
         echo "instances:" > "$OUTPUT"
 
-        cd ./instance_data || exit 1
+        cd ./instance_data
 
         for f in data_*; do
-            [ -f "$f" ] || continue
 
-            NAME=$(grep '^name:' "$f" | cut -d':' -f2- | xargs)
-            INSTANCE=$(grep '^instance:' "$f" | cut -d':' -f2- | xargs)
-            DEVICE=$(grep '^device:' "$f" | cut -d':' -f2- | xargs)
-            FSTYPE=$(grep '^fstype:' "$f" | cut -d':' -f2- | xargs)
-            IMAGEID=$(grep '^imageid:' "$f" | cut -d':' -f2- | xargs)
+          [ -f "$f" ] || continue
 
-            echo "  - name: $NAME" >> ../$OUTPUT
-            echo "    instance: $INSTANCE" >> ../$OUTPUT
-            echo "    device: $DEVICE" >> ../$OUTPUT
-            echo "    fstype: $FSTYPE" >> ../$OUTPUT
-            echo "    imageid: $IMAGEID" >> ../$OUTPUT
-            echo "" >> ../$OUTPUT
+          NAME=$(grep '^name:' "$f" | cut -d':' -f2- | xargs)
+          INSTANCE=$(grep '^instance:' "$f" | cut -d':' -f2- | xargs)
+          DEVICE=$(grep '^device:' "$f" | cut -d':' -f2- | xargs)
+          FSTYPE=$(grep '^fstype:' "$f" | cut -d':' -f2- | xargs)
+          IMAGEID=$(grep '^imageid:' "$f" | cut -d':' -f2- | xargs)
+
+          echo "  - name: $NAME" >> ../$OUTPUT
+          echo "    instance: $INSTANCE" >> ../$OUTPUT
+          echo "    device: $DEVICE" >> ../$OUTPUT
+          echo "    fstype: $FSTYPE" >> ../$OUTPUT
+          echo "    imageid: $IMAGEID" >> ../$OUTPUT
+          echo "" >> ../$OUTPUT
+
         done
       args:
         executable: /bin/bash
+
+    #################################################################
+    # Cleanup Local Folder
+    #################################################################
+
+    - name: Remove local temp folder
       delegate_to: localhost
       run_once: true
-
-    - name: Cleanup local temp folder
       ansible.builtin.file:
         path: "./instance_data"
         state: absent
-      delegate_to: localhost
-      run_once: true
