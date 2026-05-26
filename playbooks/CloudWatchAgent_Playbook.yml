@@ -93,7 +93,8 @@
         sudo /opt/aws/amazon-cloudwatch-agent/bin/amazon-cloudwatch-agent-ctl \
           -a fetch-config -m ec2 -c "file:$CONFIG_FILE" -s
 
-        service amazon-cloudwatch-agent start
+        systemctl enable amazon-cloudwatch-agent
+        systemctl restart amazon-cloudwatch-agent
 
         rm -rf "$TEMP_DIR"
       args:
